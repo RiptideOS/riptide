@@ -1,8 +1,11 @@
 #![no_std]
 #![no_main]
+#![feature(abi_x86_interrupt)]
 
 use vga::println;
 
+mod gdt;
+mod interrupts;
 mod panic;
 mod vga;
 
@@ -11,9 +14,17 @@ mod vga;
 /// performing necessary configuration.
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
-    println!("Hello World!");
+    main();
 
+    // If the main function exits, just halt the CPU
     loop {
         x86_64::instructions::hlt();
     }
+}
+
+fn main() {
+    gdt::init_gdt();
+    interrupts::init_idt();
+
+    println!("Hello World!");
 }
