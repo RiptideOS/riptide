@@ -13,7 +13,7 @@ pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 /// Initializes the Global Descriptor Table (GDT) and the Task State Segment
 /// (TSS). Must only be called once during initialization to prevent a panic.
 #[allow(clippy::let_and_return)]
-pub fn init_gdt() {
+pub fn init() {
     static GDT: StaticCell<GlobalDescriptorTable> = StaticCell::new();
     static TSS: StaticCell<TaskStateSegment> = StaticCell::new();
 

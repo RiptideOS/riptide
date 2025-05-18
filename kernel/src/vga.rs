@@ -132,25 +132,37 @@ lazy_static::lazy_static! {
 pub fn _print(args: core::fmt::Arguments) {
     use core::fmt::Write;
 
-    // NOTE: our VGA write implementation is infallible
-    WRITER.lock().write_fmt(args).unwrap();
+    // We have to disable interrupts during this call to allow interrupt handles
+    // to print to the screen
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        // NOTE: our VGA write implementation is infallible
+        WRITER.lock().write_fmt(args).unwrap();
+    });
 }
 
 /// Changes the current color code of the VGA writer
 pub fn set_color_code(color: ColorCode) {
-    WRITER.lock().color_code = color
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        WRITER.lock().color_code = color;
+    });
 }
 
 /// Executes the given function with the provided color code. This function can
-/// NOT be nested.
+/// be nested
 pub fn with_color<F: FnOnce() -> R, R>(foreground: Color, f: F) -> R {
     let mut color_code = ColorCode::new(foreground, Color::Black);
 
-    core::mem::swap(&mut WRITER.lock().color_code, &mut color_code);
+    // FIXME: is this usage of without_interrupts correct?
+
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        core::mem::swap(&mut WRITER.lock().color_code, &mut color_code);
+    });
 
     let res = f();
 
-    core::mem::swap(&mut WRITER.lock().color_code, &mut color_code);
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        core::mem::swap(&mut WRITER.lock().color_code, &mut color_code);
+    });
 
     res
 }

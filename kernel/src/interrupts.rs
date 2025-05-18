@@ -1,7 +1,16 @@
+use pc_keyboard::{DecodedKey, HandleControl, Keyboard, ScancodeSet1, layouts};
+use pic8259::ChainedPics;
+use spin::Mutex;
 use static_cell::StaticCell;
-use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
+use x86_64::{
+    instructions::port::Port,
+    structures::idt::{InterruptDescriptorTable, InterruptStackFrame},
+};
 
-use crate::{gdt, vga::println};
+use crate::{
+    gdt,
+    vga::{print, println},
+};
 
 /// Initializes the Interrupt Descriptor Table (IDT). Must only be called once
 /// during initialization to prevent a panic.
@@ -20,6 +29,9 @@ pub fn init_idt() {
             .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX);
     }
 
+    idt[InterruptIndex::Timer.as_u8()].set_handler_fn(timer_interrupt_handler);
+    idt[InterruptIndex::Keyboard.as_u8()].set_handler_fn(keyboard_interrupt_handler);
+
     idt.load();
 }
 
@@ -32,4 +44,70 @@ extern "x86-interrupt" fn double_fault_handler(
     _error_code: u64,
 ) -> ! {
     panic!("EXCEPTION: DOUBLE FAULT\n{:#?}", stack_frame);
+}
+
+const PIC_1_OFFSET: u8 = 32;
+const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
+
+static PICS: Mutex<ChainedPics> =
+    Mutex::new(unsafe { ChainedPics::new(PIC_1_OFFSET, PIC_2_OFFSET) });
+
+/// Initializes the hardware Programmable Interrupt Controllers (PICs) to remap
+/// the interrupt vector numbers into a valid range. Should only be called once
+/// during initialization.
+pub fn init_pics() {
+    let mut pics = PICS.lock();
+
+    unsafe {
+        pics.initialize();
+    }
+}
+
+unsafe fn acknowledge_interrupt(index: InterruptIndex) {
+    unsafe {
+        PICS.lock().notify_end_of_interrupt(index.as_u8());
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+#[repr(u8)]
+pub enum InterruptIndex {
+    Timer = PIC_1_OFFSET,
+    Keyboard,
+}
+
+impl InterruptIndex {
+    fn as_u8(self) -> u8 {
+        self as _
+    }
+}
+
+extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    print!(".");
+
+    unsafe { acknowledge_interrupt(InterruptIndex::Timer) };
+}
+
+extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    lazy_static::lazy_static! {
+        static ref KEYBOARD: Mutex<Keyboard<layouts::Us104Key, ScancodeSet1>> =
+            Mutex::new(Keyboard::new(ScancodeSet1::new(),
+                layouts::Us104Key, HandleControl::Ignore)
+            );
+    }
+
+    let mut keyboard = KEYBOARD.lock();
+    let mut port = Port::new(0x60);
+
+    let scancode: u8 = unsafe { port.read() };
+    if let Ok(Some(key_event)) = keyboard.add_byte(scancode) {
+        if let Some(key) = keyboard.process_keyevent(key_event) {
+            match key {
+                DecodedKey::Unicode(character) => print!("{}", character),
+                DecodedKey::RawKey(key) => print!("{:?}", key),
+            }
+        }
+    }
+
+    unsafe { acknowledge_interrupt(InterruptIndex::Keyboard) };
 }

@@ -23,8 +23,11 @@ pub extern "C" fn _start() -> ! {
 }
 
 fn main() {
-    gdt::init_gdt();
+    gdt::init();
     interrupts::init_idt();
+    interrupts::init_pics();
+
+    x86_64::instructions::interrupts::enable();
 
     println!("Hello World!");
 }
