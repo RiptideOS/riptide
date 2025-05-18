@@ -1,0 +1,4 @@
+{
+    "rust-analyzer.cargo.target": ".cargo/x86_64-riptide.json",
+    "rust-analyzer.cargo.allTargets": false
+}
