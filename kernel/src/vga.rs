@@ -10,8 +10,8 @@ struct Writer {
     buffer: &'static mut Buffer,
 }
 
-const BUFFER_HEIGHT: usize = 25;
-const BUFFER_WIDTH: usize = 80;
+pub const BUFFER_HEIGHT: usize = 25;
+pub const BUFFER_WIDTH: usize = 80;
 
 #[repr(transparent)]
 struct Buffer {
@@ -177,3 +177,60 @@ macro_rules! println {
     ($($arg:tt)*) => ($crate::vga::print!("{}\n", format_args!($($arg)*)));
 }
 pub(crate) use println;
+use x86_64::instructions::port::Port;
+
+/// Moves the cursor on the current line
+pub fn set_column_position(position: u8) {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        WRITER.lock().column_position = (position as usize).min(BUFFER_WIDTH)
+    });
+}
+
+const VGA_CMD_PORT: u16 = 0x3D4;
+const VGA_DATA_PORT: u16 = 0x3D5;
+
+/// Moves the cursor on the current line
+pub fn set_cursor_position(x: u8, y: u8) {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut cmd_port = Port::<u8>::new(VGA_CMD_PORT);
+        let mut data_port = Port::<u8>::new(VGA_DATA_PORT);
+
+        let pos = y as u16 * BUFFER_WIDTH as u16 + x as u16;
+
+        unsafe {
+            cmd_port.write(0x0F);
+            data_port.write((pos & 0xFF) as u8);
+            cmd_port.write(0x0E);
+            data_port.write(((pos >> 8) & 0xFF) as u8);
+        }
+    });
+}
+
+pub fn enable_cursor(start: u8, end: u8) {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut cmd_port = Port::<u8>::new(VGA_CMD_PORT);
+        let mut data_port = Port::<u8>::new(VGA_DATA_PORT);
+
+        unsafe {
+            cmd_port.write(0x0A);
+            let s = data_port.read();
+            data_port.write((s & 0xC0) | start);
+
+            cmd_port.write(0x0B);
+            let e = data_port.read();
+            data_port.write((e & 0xE0) | end);
+        }
+    });
+}
+
+pub fn disable_cursor() {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut cmd_port = Port::<u8>::new(VGA_CMD_PORT);
+        let mut data_port = Port::<u8>::new(VGA_DATA_PORT);
+
+        unsafe {
+            cmd_port.write(0x0A);
+            data_port.write(0x20);
+        }
+    });
+}

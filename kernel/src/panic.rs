@@ -38,8 +38,11 @@ fn panic(info: &PanicInfo) -> ! {
 
     vga::with_color(Color::LightGray, || println!("{}", info.message()));
 
+    vga::disable_cursor();
+
     /* Hang the processor */
 
+    x86_64::instructions::interrupts::disable();
     loop {
         x86_64::instructions::hlt();
     }

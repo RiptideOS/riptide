@@ -1,11 +1,13 @@
 #![no_std]
 #![no_main]
 #![feature(abi_x86_interrupt)]
+#![feature(str_from_raw_parts)]
 
 extern crate alloc;
 
 use bootloader::BootInfo;
 use memory::BootInfoFrameAllocator;
+use task::{Task, executor::Executor};
 use vga::println;
 use x86_64::VirtAddr;
 
@@ -14,6 +16,8 @@ mod gdt;
 mod interrupts;
 mod memory;
 mod panic;
+mod shell;
+mod task;
 mod vga;
 
 bootloader::entry_point!(kernel_main);
@@ -36,9 +40,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
 
     allocator::init_heap(&mut mapper, &mut frame_allocator).expect("heap initialization failed");
 
-    println!("We survived!");
-
-    loop {
-        x86_64::instructions::hlt();
-    }
+    let mut executor = Executor::new();
+    executor.spawn(Task::new(shell::run()));
+    executor.run();
 }
