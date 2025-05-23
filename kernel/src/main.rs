@@ -12,12 +12,16 @@ use vga::println;
 use x86_64::VirtAddr;
 
 mod allocator;
+mod device;
+mod drivers;
+mod fs;
 mod gdt;
 mod interrupts;
 mod memory;
 mod panic;
 mod shell;
 mod task;
+mod util;
 mod vga;
 
 bootloader::entry_point!(kernel_main);
@@ -39,6 +43,9 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     let mut frame_allocator = unsafe { BootInfoFrameAllocator::init(&boot_info.memory_map) };
 
     allocator::init_heap(&mut mapper, &mut frame_allocator).expect("heap initialization failed");
+
+    drivers::char::init().expect("failed to init char dev drivers");
+    fs::init();
 
     let mut executor = Executor::new();
     executor.spawn(Task::new(shell::run()));

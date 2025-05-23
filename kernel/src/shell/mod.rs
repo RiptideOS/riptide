@@ -1,9 +1,17 @@
+use alloc::string::String;
+
 use futures_util::StreamExt;
 use keyboard::ScancodeStream;
 use parser::Parser;
 use pc_keyboard::{DecodedKey, HandleControl, Keyboard, ScancodeSet1, layouts::Us104Key};
 
-use crate::vga::{self, Color, print, println};
+use crate::{
+    fs::{
+        FileMode,
+        vfs::{self, DirectoryEntry, IoError},
+    },
+    vga::{self, Color, print, println},
+};
 
 pub mod keyboard;
 pub mod parser;
@@ -115,50 +123,122 @@ async fn parse_and_execute(input: &str) -> bool {
 
     vga::with_color(Color::LightGray, || println!("args: {:?}", args));
 
-    match args.pop_front() {
-        Some("help") => {
-            println!("Help message")
-        }
-        Some("whoami") => {
-            println!("root")
-        }
-        Some("echo" | "print") => {
-            let len = args.len();
+    loop {
+        match args.pop_front() {
+            Some("help") => {
+                println!("TODO: insert a help message here")
+            }
+            Some("whoami") => {
+                println!("root")
+            }
+            Some("echo" | "print") => {
+                let len = args.len();
 
-            for (i, arg) in args.iter().enumerate() {
-                print!("{arg}");
+                for (i, arg) in args.iter().enumerate() {
+                    print!("{arg}");
 
-                if i < len - 1 {
-                    print!(" ");
+                    if i < len - 1 {
+                        print!(" ");
+                    }
+                }
+
+                println!();
+            }
+            Some("pwd") => {
+                println!("/");
+            }
+            Some("uname") => {
+                print!("Riptide");
+
+                if let Some(&"-a") = args.front() {
+                    print!(" riptide {} x86_64", env!("CARGO_PKG_VERSION"));
+                }
+
+                println!();
+            }
+            Some("ls") => {
+                let path = args.front().cloned().unwrap_or("/"); // FIXME: use pwd
+
+                let all = false; // FIXME: parse from args (-a)
+                let long = true; // FIXME: parse from args (-l)
+                let human_readable = false; // FIXME: parse from args (-h)
+                let show_node_ids = false; // FIXME: parse from args (-i)
+
+                let e = match vfs::get().stat(path) {
+                    Ok(e) => e,
+                    Err(IoError::EntryNotFound) => {
+                        println!("ls: {}: No such file or directory", path);
+                        break;
+                    }
+                    Err(_) => todo!(),
+                };
+
+                fn format_entry(entry: &DirectoryEntry, long: bool) {
+                    if long {
+                        println!(
+                            "{}rw-r--r--@ 1 root root {:>3} <modify_time> {}",
+                            entry.node.kind, entry.node.size, entry.name
+                        );
+                    } else {
+                        println!("{}", entry.name)
+                    }
+                }
+
+                if e.node.is_directory() {
+                    let entries = match vfs::get().read_directory(path) {
+                        Ok(v) => v,
+                        Err(_) => todo!(),
+                    };
+
+                    for entry in entries {
+                        format_entry(&entry, long);
+                    }
+                } else {
+                    format_entry(&e, long);
                 }
             }
+            Some("cat") => {
+                let Some(path) = args.front() else {
+                    println!("error: no path provided");
+                    break;
+                };
 
-            println!();
-        }
-        Some("pwd") => {
-            println!("/root");
-        }
-        Some("uname") => {
-            print!("Riptide");
+                let f = vfs::get().open(path, FileMode::Read).unwrap();
 
-            if let Some(&"-a") = args.front() {
-                print!(" riptide {} x86_64", env!("CARGO_PKG_VERSION"));
+                let mut data = [0u8; 512];
+
+                let bytes = vfs::get().read(f, &mut data).unwrap();
+
+                let data = &data[..bytes];
+
+                println!("{}", String::from_utf8_lossy(data));
             }
+            Some("touch") => {
+                let Some(path) = args.front() else {
+                    println!("error: no path provided");
+                    break;
+                };
 
-            println!();
+                let f = vfs::get().open(path, FileMode::Write).unwrap();
+                vfs::get().close(f).unwrap();
+            }
+            Some("mkdir") => println!("error: not implemented yet"),
+            Some("rm") => println!("error: not implemented yet"),
+            Some("realpath") => println!("error: not implemented yet"),
+            Some("basename") => println!("error: not implemented yet"),
+            Some("cd") => println!("error: not implemented yet"),
+            Some("exit") => {
+                return true;
+            }
+            // Unrecognized command
+            Some(cmd) => {
+                println!("command not found: {}", cmd)
+            }
+            // Got no actual input (just whitespace)
+            None => {}
         }
-        Some("ls") => todo!("list files"),
-        Some("cat") => todo!("read file"),
-        Some("touch") => todo!("create file"),
-        Some("exit") => {
-            return true;
-        }
-        // Unrecognized command
-        Some(cmd) => {
-            println!("command not found: {}", cmd)
-        }
-        // Got no actual input (just whitespace)
-        None => {}
+
+        break;
     }
 
     false
