@@ -1,11 +1,8 @@
 use alloc::{
     string::{String, ToString},
-    sync::Arc,
     vec::Vec,
 };
 use core::str::FromStr;
-
-use super::vfs::DirectoryEntry;
 
 const MAX_PATH_LENGTH: usize = 4096;
 
@@ -18,13 +15,6 @@ impl Path {
     /// Returns true if this path starts with a "/"
     pub fn is_absolute(&self) -> bool {
         self.segments.first().unwrap() == "/"
-    }
-
-    /// Returns true if this path is the root directory (only contains the "/"
-    /// segment). This function does not handle dots (i.e. a path parsed from
-    /// the string "/./" would not return true)
-    pub fn is_root(&self) -> bool {
-        self.is_absolute() && self.segments.len() == 1
     }
 
     pub fn segments(&self) -> impl Iterator<Item = &str> {

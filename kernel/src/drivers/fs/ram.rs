@@ -1,13 +1,13 @@
-use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, collections::btree_map::BTreeMap, sync::Arc, vec::Vec};
 
-use spin::RwLock;
+use spin::{Mutex, RwLock};
 
 use crate::{
     fs::{
         DirectoryOperations, File, FileOperations, FileSystem, FileSystemMetadata, FileSystemType,
-        FileSystemTypeMetadata, FsNode, FsNodeId, FsNodeKind, FsNodeOperations, MountFlags,
-        impl_fs_ops_for_self,
-        vfs::{DirectoryEntry, IoError, MountId},
+        FileSystemTypeMetadata, FsNode, FsNodeId, FsNodeKind, FsNodeLock, FsNodeMetadata,
+        FsNodeOperations, MountFlags, impl_fs_ops_for_self,
+        vfs::{DirectoryEntry, DirectoryIterationContext, IoError, MountId},
     },
     util::sync_cell::SynCell,
 };
@@ -42,11 +42,15 @@ impl FileSystemType for RamFileSystemType {
                 mount_id,
                 id: FsNodeId::ZERO,
                 kind: FsNodeKind::Directory,
-                dirty: false,
-                size: 0,
-                accessed_at: 0,
-                created_at: 0,
-                modified_at: 0,
+                metadata: Mutex::new(FsNodeMetadata {
+                    dirty: false,
+                    link_count: 1,
+                    size: 0,
+                    accessed_at: 0,
+                    created_at: 0,
+                    modified_at: 0,
+                }),
+                structure_lock: Mutex::new(FsNodeLock),
                 private_data: Some(Box::new(RamDirectoryNode::default())),
             }),
             next_node_id: SynCell::new(FsNodeId::new(1)),
@@ -139,101 +143,119 @@ impl FileOperations for RamFileSystem {
 }
 #[derive(Default)]
 pub struct RamDirectoryNode {
-    children: RwLock<Vec<Arc<DirectoryEntry>>>,
+    // NOTE: we use a map from names to FsNodes instead of directory entries
+    // because other file systems can be mounted over the children of this
+    // directory. keeping this separate allows the cache to manage the
+    // resolution more easily.
+    children: RwLock<BTreeMap<Arc<str>, Arc<FsNode>>>,
 }
 
 impl DirectoryOperations for RamFileSystem {
     fn create_file(
         &self,
-        directory: Arc<DirectoryEntry>,
+        parent: &Arc<DirectoryEntry>,
         name: &str,
-    ) -> Result<Arc<DirectoryEntry>, IoError> {
+    ) -> Result<Arc<FsNode>, IoError> {
         let node = Arc::new(FsNode {
             id: self.next_node_id(),
             mount_id: self.root.mount_id,
             kind: FsNodeKind::File,
-            dirty: false,
-            size: 0,
-            accessed_at: 0,
-            created_at: 0,
-            modified_at: 0,
+            metadata: Mutex::new(FsNodeMetadata {
+                dirty: false,
+                link_count: 1,
+                size: 0,
+                accessed_at: 0,
+                created_at: 0,
+                modified_at: 0,
+            }),
+            structure_lock: Mutex::new(FsNodeLock),
             private_data: Some(Box::new(RamFileNode::default())),
         });
 
-        let entry = Arc::new(DirectoryEntry {
-            name: name.into(),
-            node,
-            parent: Some(directory.clone()),
-        });
+        let parent = parent.node.data_as::<RamDirectoryNode>();
+        parent.children.write().insert(name.into(), node.clone());
 
-        let parent = directory.node.data_as::<RamDirectoryNode>();
-        parent.children.write().push(entry.clone());
-
-        Ok(entry)
+        Ok(node)
     }
 
     fn create_directory(
         &self,
-        directory: Arc<DirectoryEntry>,
+        parent: &Arc<DirectoryEntry>,
         name: &str,
-    ) -> Result<Arc<DirectoryEntry>, IoError> {
-        // FIXME: check if already exists
-
+    ) -> Result<Arc<FsNode>, IoError> {
         let node = Arc::new(FsNode {
             id: self.next_node_id(),
             mount_id: self.root.mount_id,
             kind: FsNodeKind::Directory,
-            dirty: false,
-            size: 0,
-            accessed_at: 0,
-            created_at: 0,
-            modified_at: 0,
+            metadata: Mutex::new(FsNodeMetadata {
+                dirty: false,
+                link_count: 1,
+                size: 0,
+                accessed_at: 0,
+                created_at: 0,
+                modified_at: 0,
+            }),
+            structure_lock: Mutex::new(FsNodeLock),
             private_data: Some(Box::new(RamDirectoryNode::default())),
         });
 
-        let entry = Arc::new(DirectoryEntry {
-            name: name.into(),
-            node,
-            parent: Some(directory.clone()),
-        });
+        // FIXME: check if already exists
 
-        let parent = directory.node.data_as::<RamDirectoryNode>();
-        parent.children.write().push(entry.clone());
+        let parent = parent.node.data_as::<RamDirectoryNode>();
+        parent.children.write().insert(name.into(), node.clone());
 
-        Ok(entry)
+        Ok(node)
     }
 
-    fn remove_file(&self) -> Result<Arc<FsNode>, IoError> {
-        todo!()
+    fn remove_file(&self, parent: &Arc<DirectoryEntry>, name: &str) -> Result<(), IoError> {
+        let parent = parent.node.data_as::<RamDirectoryNode>();
+
+        if parent.children.write().remove(name).is_none() {
+            return Err(IoError::EntryNotFound);
+        }
+
+        Ok(())
     }
 
-    fn remove_directory(&self) -> Result<Arc<FsNode>, IoError> {
+    fn remove_directory(&self, parent: &Arc<DirectoryEntry>, name: &str) -> Result<(), IoError> {
+        // NOTE: this function is called with the locks for both the parent and
+        // the child held. This prevents them from being modified while we are
+        // trying to remove them
+        let parent = parent.node.data_as::<RamDirectoryNode>();
+
+        let children = parent.children.write();
+
+        let dir = children.get(name).ok_or(IoError::EntryNotFound)?;
+
+        assert!(dir.is_directory());
+        let dir_node = dir.data_as::<RamDirectoryNode>();
+        assert!(dir_node.children.read().is_empty());
+
+        // fixme: check child is empty
         todo!()
     }
 
     fn lookup(
         &self,
-        entry: Arc<DirectoryEntry>,
+        parent: &Arc<DirectoryEntry>,
         name: &str,
-    ) -> Result<Option<Arc<DirectoryEntry>>, IoError> {
-        let d_node = entry.node.data_as::<RamDirectoryNode>();
+    ) -> Result<Option<Arc<FsNode>>, IoError> {
+        let d_node = parent.node.data_as::<RamDirectoryNode>();
 
-        Ok(d_node
-            .children
-            .read()
-            .iter()
-            .find(|e| e.name.as_ref() == name)
-            .cloned())
+        Ok(d_node.children.read().get(name).cloned())
     }
 
     fn read_directory(
         &self,
-        entry: Arc<DirectoryEntry>,
-    ) -> Result<Vec<Arc<DirectoryEntry>>, IoError> {
-        assert!(entry.node.is_directory());
+        context: &mut DirectoryIterationContext,
+        directory: &Arc<DirectoryEntry>,
+    ) -> Result<(), IoError> {
+        let d_node = directory.node.data_as::<RamDirectoryNode>();
 
-        let d_node = entry.node.data_as::<RamDirectoryNode>();
+        for (name, node) in d_node.children.read().iter() {
+            context.insert(name, node.id, node.kind);
+        }
 
-        Ok(d_node.children.read().clone())
+        Ok(())
     }
 }

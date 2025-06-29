@@ -198,6 +198,7 @@ dependencies = [
  "linked_list_allocator",
  "pc-keyboard",
  "pic8259",
+ "scopeguard",
  "spin 0.5.2",
  "static_cell",
  "thiserror",

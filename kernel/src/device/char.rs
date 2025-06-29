@@ -43,8 +43,6 @@ pub fn list_char_devices() -> Vec<Arc<dyn CharDevice>> {
     CHAR_DEVICE_REGISTRY.lock().values().cloned().collect()
 }
 
-
-
 pub fn get_char_device(name: &str) -> Option<Arc<dyn CharDevice>> {
     CHAR_DEVICE_REGISTRY.lock().get(name).cloned()
 }

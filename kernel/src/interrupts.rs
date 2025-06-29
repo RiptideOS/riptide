@@ -93,7 +93,7 @@ impl InterruptIndex {
 }
 
 extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
-    // print!(".");
+    crate::vga::print!(".");
 
     unsafe { acknowledge_interrupt(InterruptIndex::Timer) };
 }

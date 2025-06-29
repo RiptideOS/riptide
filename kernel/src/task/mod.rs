@@ -1,14 +1,15 @@
 use alloc::boxed::Box;
 use core::{
-    future::Future, pin::Pin, sync::atomic::{AtomicU64, Ordering}, task::{Context, Poll}
+    future::Future,
+    pin::Pin,
+    sync::atomic::{AtomicU64, Ordering},
+    task::{Context, Poll},
 };
-
 
 pub mod executor;
 
-
 pub struct Task {
-    id: TaskId, 
+    id: TaskId,
     future: Pin<Box<dyn Future<Output = ()>>>,
 }
 

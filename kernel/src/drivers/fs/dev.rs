@@ -1,12 +1,14 @@
-use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, sync::Arc};
+
+use spin::Mutex;
 
 use crate::{
     device::char::{CharDevice, get_char_device, list_char_devices},
     fs::{
         DirectoryOperations, File, FileOperations, FileSystem, FileSystemMetadata, FileSystemType,
-        FileSystemTypeMetadata, FsNode, FsNodeId, FsNodeKind, FsNodeOperations, MountFlags,
-        impl_fs_ops_for_self,
-        vfs::{self, DirectoryEntry, IoError, MountId},
+        FileSystemTypeMetadata, FsNode, FsNodeId, FsNodeKind, FsNodeLock, FsNodeMetadata,
+        FsNodeOperations, MountFlags, impl_fs_ops_for_self,
+        vfs::{DirectoryEntry, DirectoryIterationContext, IoError, MountId},
     },
     util::sync_cell::SynCell,
 };
@@ -41,11 +43,15 @@ impl FileSystemType for DevFileSystemType {
                 mount_id,
                 id: FsNodeId::ZERO,
                 kind: FsNodeKind::Directory,
-                dirty: false,
-                size: 0,
-                accessed_at: 0,
-                created_at: 0,
-                modified_at: 0,
+                metadata: Mutex::new(FsNodeMetadata {
+                    dirty: false,
+                    link_count: 1,
+                    size: 0,
+                    accessed_at: 0,
+                    created_at: 0,
+                    modified_at: 0,
+                }),
+                structure_lock: Mutex::new(FsNodeLock),
                 private_data: None,
             }),
             next_node_id: SynCell::new(FsNodeId::new(1)),
@@ -123,64 +129,52 @@ impl FileOperations for DevFileSystem {
 impl DirectoryOperations for DevFileSystem {
     fn lookup(
         &self,
-        entry: Arc<DirectoryEntry>,
+        _parent: &Arc<DirectoryEntry>,
         name: &str,
-    ) -> Result<Option<Arc<DirectoryEntry>>, IoError> {
-        assert!(entry.node.is_directory());
-
+    ) -> Result<Option<Arc<FsNode>>, IoError> {
         // We only support a single directory right now, so just lookup the name
         // in the device table
 
         Ok(get_char_device(name).map(|d| {
-            Arc::new(DirectoryEntry {
-                name: d.metadata().name.into(),
-                node: Arc::new(FsNode {
-                    id: self.next_node_id(),
-                    mount_id: self.root.mount_id,
-                    kind: FsNodeKind::CharDevice,
+            Arc::new(FsNode {
+                // FIXME: see below comment about consistent node ids
+                id: self.next_node_id(),
+                mount_id: self.root.mount_id,
+                kind: FsNodeKind::CharDevice,
+                metadata: Mutex::new(FsNodeMetadata {
                     dirty: false,
+                    link_count: 1,
+                    // FIXME: what should these be?
                     size: 0,
                     accessed_at: 0,
                     created_at: 0,
                     modified_at: 0,
-                    private_data: Some(Box::new(d)),
                 }),
-                parent: Some(vfs::get().get_mount_root(self.root.mount_id).unwrap()),
+                structure_lock: Mutex::new(FsNodeLock),
+                private_data: Some(Box::new(d)),
             })
         }))
     }
 
     fn read_directory(
         &self,
-        entry: Arc<DirectoryEntry>,
-    ) -> Result<Vec<Arc<DirectoryEntry>>, IoError> {
-        assert!(entry.node.is_directory());
-
+        context: &mut DirectoryIterationContext,
+        _entry: &Arc<DirectoryEntry>,
+    ) -> Result<(), IoError> {
         // We only support a single directory right now, so just list all
         // devices currently registered in the device table
 
-        // FIXME: we should always be returning the same fsnode ids for any
-        // given device but for now this is ok
-
-        Ok(list_char_devices()
-            .into_iter()
-            .map(|d| {
-                Arc::new(DirectoryEntry {
-                    name: d.metadata().name.into(),
-                    node: Arc::new(FsNode {
-                        id: self.next_node_id(),
-                        mount_id: self.root.mount_id,
-                        kind: FsNodeKind::CharDevice,
-                        dirty: false,
-                        size: 0,
-                        accessed_at: 0,
-                        created_at: 0,
-                        modified_at: 0,
-                        private_data: Some(Box::new(d)),
-                    }),
-                    parent: Some(vfs::get().get_mount_root(self.root.mount_id).unwrap()),
-                })
-            })
-            .collect())
+        for dev in list_char_devices() {
+            context.insert(
+                dev.metadata().name,
+                // FIXME: we should always be returning the same fsnode ids for
+                // any given device but for now this is ok. can we assign global
+                // ids to each device and then store a mapping from device ids
+                // to node ids? should the device ids just be the node ids?
+                self.next_node_id(),
+                FsNodeKind::CharDevice,
+            );
+        }
+        Ok(())
     }
 }

@@ -1,8 +1,7 @@
 use alloc::{
     collections::{BTreeMap, VecDeque},
     string::{String, ToString},
-    sync::Arc,
-    vec::Vec,
+    sync::{Arc, Weak},
 };
 use core::{
     str::FromStr,
@@ -12,8 +11,45 @@ use core::{
 use conquer_once::spin::OnceCell;
 use spin::RwLock;
 
-use super::{File, FileDescriptor, FileSystem, FsNode, path::Path};
-use crate::fs::{FileMode, FsNodeKind, MountFlags, registry::find_file_system_type};
+use super::{File, FileDescriptor, FileSystem, FsNode, FsNodeId, path::Path};
+use crate::{
+    fs::{FileMode, FsNodeKind, MountFlags, registry::find_file_system_type},
+    util::defer::defer_handle,
+};
+
+#[derive(Debug)]
+pub enum IoError {
+    /// The requested operation is not implemented by the target file system or
+    /// device
+    OperationNotSupported,
+    /// Some element of a provided path was not found in the file system
+    EntryNotFound,
+    /// The provided path already exists (for create operations) or is already
+    /// occupied by a mounted file system
+    AlreadyExists,
+    /// The path provided to an operation did not contain a directory where one
+    /// was expected (i.e. tried to specify a path segment after the name of an
+    /// existing file)
+    NotADirectory,
+    /// The path provided to an operation did not contain a file where one was
+    /// expected (i.e. tried to open a directory as a file)
+    NotAFile,
+    /// The provided path was not valid (contained invalid characters) or
+    /// otherwise could not be parsed
+    InvalidPath,
+    /// File pointer is not registered in the file table (this file has already
+    /// been closed)
+    InvalidFile,
+    /// The requested operation is not compatible with the mode the target file
+    /// was opened with (i.e. trying to write to a file descriptor which was
+    /// opened in read mode)
+    InvalidMode,
+    /// The requested file system type in a mount operation was not found
+    FileSystemTypeNotFound,
+    /// Only ever returned if a resolution operation is attempted before the
+    /// root of the file system has been mounted
+    NoRootDirectory,
+}
 
 #[derive(Default)]
 pub struct VirtualFileSystem {
@@ -21,8 +57,12 @@ pub struct VirtualFileSystem {
     files: RwLock<BTreeMap<FileDescriptor, Arc<File>>>,
     /// A table which keeps track of the mount points of file systems
     mount_table: RwLock<BTreeMap<MountId, Arc<VfsMount>>>,
-
-    root_directory: RwLock<Option<Arc<DirectoryEntry>>>,
+    /// An in-memory cache of directory entries. This maps file names to their
+    /// coresponding FsNode objects and is the mechanism used to perform path
+    /// walking and lookups. Keeping this cache prevents having to contstantly
+    /// query the file system implementation with lookup calls since the
+    /// underlying data doesn't change for most file systems.
+    directory_cache: RwLock<DirectoryCache>,
 }
 
 impl VirtualFileSystem {
@@ -32,7 +72,7 @@ impl VirtualFileSystem {
 
     /// Creates an empty ramfs and mounts it as the root directory
     fn create_root(&self) -> Result<Arc<DirectoryEntry>, IoError> {
-        assert!(self.root_directory.read().is_none());
+        assert!(self.directory_cache.read().get_root().is_none());
 
         let id = self.mount("", "/", Some("ramfs"), MountFlags::READ | MountFlags::WRITE)?;
         let mount = self.get_mount(id).unwrap();
@@ -40,19 +80,53 @@ impl VirtualFileSystem {
         Ok(mount.root.clone())
     }
 
+    /// Looks up an entry in the cache or attempts to fetch it from the file
+    /// system if not found, subsequently inserting it into the cache
+    fn get_cached_or_lookup(
+        &self,
+        parent: &Arc<DirectoryEntry>,
+        name: &str,
+    ) -> Result<Option<Arc<DirectoryEntry>>, IoError> {
+        // check the cache
+        if let Some(cached) = self.directory_cache.read().lookup(parent, name) {
+            return Ok(Some(cached));
+        }
+
+        // check the backing fs of the current top node
+        let fs = parent.node.file_system();
+        let Some(node) = fs.directory_operations().lookup(parent, name)? else {
+            return Ok(None);
+        };
+
+        // insert into the cache for future lookups
+        let entry = self
+            .directory_cache
+            .write()
+            .insert(Some(parent.clone()), node, name);
+
+        Ok(Some(entry))
+    }
+
     /// Resolves all segments in a path to a directory entry in the VFS,
     /// returning the last entry in the path if all resolutions were successful.
     /// If a path segment cannot be resolved, None is returned. An Err is only
     /// returned if the fs driver encountered an error while performing the io
     /// to lookup a name.
+    ///
+    /// If a path segment is being resolved for the first time, it is added to
+    /// the cache. Subsequent queries while strong references to an entry or one
+    /// of its children still exist will result in a faster cache hit. Returned
+    /// entries which identify the same entry on disk are guaranteed to have the
+    /// same ID for as long as strong referernces to the entry exist in memory.
+    /// When reloaded from disk, IDs are regenerated.
     fn resolve_path(&self, path: &str) -> Result<Option<Arc<DirectoryEntry>>, IoError> {
         let path = Path::from_str(path).map_err(|_| IoError::InvalidPath)?;
 
         if !path.is_absolute() {
-            todo!("resolve relative paths");
+            todo!("resolve relative paths ({path:?})");
         }
 
-        let Some(root_directory) = self.root_directory.read().clone() else {
+        let Some(root_directory) = self.directory_cache.read().get_root() else {
             return Err(IoError::NoRootDirectory);
         };
 
@@ -99,9 +173,7 @@ impl VirtualFileSystem {
                         }
                     }
 
-                    // check the backing fs of the current top node
-                    let fs = top.node.file_system();
-                    let Some(entry) = fs.directory_operations().lookup(top.clone(), name)? else {
+                    let Some(entry) = self.get_cached_or_lookup(top, name)? else {
                         return Ok(None);
                     };
 
@@ -125,7 +197,7 @@ impl VirtualFileSystem {
             todo!("canonicalize relative paths");
         }
 
-        let Some(root_directory) = self.root_directory.read().clone() else {
+        let Some(root_directory) = self.directory_cache.read().get_root() else {
             return Err(IoError::NoRootDirectory);
         };
 
@@ -157,10 +229,8 @@ impl VirtualFileSystem {
                         // the resolution stack
 
                         let top = stack.back().expect("root should always exist");
-                        let fs = top.node.file_system();
 
-                        let Some(entry) = fs.directory_operations().lookup(top.clone(), name)?
-                        else {
+                        let Some(entry) = self.get_cached_or_lookup(top, name)? else {
                             return Err(IoError::EntryNotFound);
                         };
 
@@ -184,10 +254,6 @@ impl VirtualFileSystem {
         self.mount_table.read().get(&id).cloned()
     }
 
-    pub fn get_mount_root(&self, id: MountId) -> Option<Arc<DirectoryEntry>> {
-        self.get_mount(id).map(|m| m.root.clone())
-    }
-
     /// Mounts the given file system in the specified directory. The backing FS
     /// can be a block device or a regular file.
     pub fn mount(
@@ -198,7 +264,7 @@ impl VirtualFileSystem {
         flags: MountFlags,
     ) -> Result<MountId, IoError> {
         // If a desired type was specified, use that. Otherwise we will try to
-        // guess based on the magic.ç
+        // guess based on the magic.
         let fs_type = match kind {
             Some(k) => Some(find_file_system_type(k).ok_or(IoError::FileSystemTypeNotFound)?),
             None => None,
@@ -215,22 +281,16 @@ impl VirtualFileSystem {
         // There is a special case here if we are mounting the root of the
         // entire VFS because there is additional state we need to initialize.
         let mount = if target == "/" {
-            let mut vfs_root = self.root_directory.write();
+            let mut cache = self.directory_cache.write();
 
-            if vfs_root.is_some() {
-                return Err(IoError::RootAlreadyExists);
+            if cache.get_root().is_some() {
+                return Err(IoError::AlreadyExists);
             }
 
             let id = MountId::new();
             let fs = ty.mount(id, source, flags)?;
 
-            let root = Arc::new(DirectoryEntry {
-                name: "/".into(),
-                node: fs.root_directory(),
-                parent: None,
-            });
-
-            *vfs_root = Some(root.clone());
+            let root = cache.insert(None, fs.root_directory(), "/");
 
             VfsMount {
                 id,
@@ -244,6 +304,9 @@ impl VirtualFileSystem {
             // let fs = ty.mount(id, source, flags)?;
 
             // todo: check if is dir
+            // todo: make sure to invalidate directory cache?
+            // todo: make sure to lock parent while we do this and then check
+            // again
 
             todo!()
         }
@@ -251,17 +314,18 @@ impl VirtualFileSystem {
         else {
             let (parent, name) = self.resolve_path_parent_directory(target)?;
 
+            let _lock = parent.node.structure_lock.lock();
+
             // FIXME: check that this name is not already mounted in the
             // parent directory
+            // FIXME: check that this name is not already taken in the parent
+            // dir (after acquiring the lock on the parent)
 
             let id = MountId::new();
             let fs = ty.mount(id, source, flags)?;
 
-            let root = Arc::new(DirectoryEntry {
-                name: name.into(),
-                node: fs.root_directory(),
-                parent: Some(parent),
-            });
+            let mut cache = self.directory_cache.write();
+            let root = cache.insert(Some(parent.clone()), fs.root_directory(), name);
 
             VfsMount {
                 id,
@@ -302,12 +366,20 @@ impl VirtualFileSystem {
                 let (parent, file_name) = self.resolve_path_parent_directory(path)?;
 
                 let fs = parent.node.file_system();
-                fs.directory_operations()
-                    .create_file(parent.clone(), &file_name)?
+                let node = fs.directory_operations().create_file(&parent, &file_name)?;
+
+                self.directory_cache
+                    .write()
+                    .insert(Some(parent), node, file_name)
             }
         } else {
             self.resolve_path(path)?.ok_or(IoError::EntryNotFound)?
         };
+
+        file_entry.node.increment_link_count();
+        let error_cleanup = defer_handle!({
+            file_entry.node.decrement_link_count();
+        });
 
         let fs = file_entry.node.file_system();
         let file = Arc::new(fs.file_operations().open(file_entry.node.clone(), mode)?);
@@ -315,6 +387,7 @@ impl VirtualFileSystem {
         let fd = FileDescriptor::new();
         self.files.write().insert(fd, file.clone());
 
+        error_cleanup.cancel();
         Ok(fd)
     }
 
@@ -326,6 +399,7 @@ impl VirtualFileSystem {
         fs.file_operations().flush(&file)?;
 
         self.files.write().remove(&fd);
+        file.node.decrement_link_count();
 
         Ok(())
     }
@@ -368,6 +442,8 @@ impl VirtualFileSystem {
         // FIXME: check that buffer is smaller than max write size
         // FIXME: update file modify time
 
+        
+
         let fs = file.file_system();
 
         /* Write and update the current offset if successful */
@@ -383,25 +459,22 @@ impl VirtualFileSystem {
     /// Lists the contents of a directory in the virtual file system. Uses the
     /// FsNode assiciated with the provided path as well as entries from the
     /// mount table.
-    pub fn read_directory(&self, path: &str) -> Result<Vec<Arc<DirectoryEntry>>, IoError> {
+    pub fn read_directory(&self, path: &str) -> Result<DirectoryIterationContext, IoError> {
         let directory = self.resolve_path(path)?.ok_or(IoError::EntryNotFound)?;
+
+        // Dont allow modification to this directory while we are iterating it
+        let _guard = directory.node.structure_lock.lock();
+
         if !directory.node.is_directory() {
             return Err(IoError::NotADirectory);
         }
 
-        // we need to collect results in a map because mounts may be mounted on
-        // top of existing directory entries
-        let mut res = BTreeMap::new();
+        let mut ctx = DirectoryIterationContext::new();
 
         // Default readdir for this file system
         let fs = directory.node.file_system();
-        res.extend(
-            &mut fs
-                .directory_operations()
-                .read_directory(directory.clone())?
-                .into_iter()
-                .map(|d| (d.name.clone(), d)),
-        );
+        fs.directory_operations()
+            .read_directory(&mut ctx, &directory)?;
 
         // Any VFS mounts whose root directory is within this directory should
         // also be added to the result
@@ -410,46 +483,129 @@ impl VirtualFileSystem {
                 continue;
             };
 
-            if parent == &directory {
-                res.insert(mnt.root.name.clone(), mnt.root.clone());
+            if *parent == directory {
+                ctx.insert(&mnt.root.name, mnt.root.node.id, mnt.root.node.kind);
             }
         }
 
-        Ok(res.into_values().collect())
+        Ok(ctx)
+    }
+
+    pub fn create_directory(&self, path: &str) -> Result<Arc<DirectoryEntry>, IoError> {
+        if self.resolve_path(path)?.is_some() {
+            return Err(IoError::AlreadyExists);
+        }
+
+        let (parent, dir_name) = self.resolve_path_parent_directory(path)?;
+
+        // Lock the parent to make sure that we dont try to create or delete
+        // other entries concurrently
+        let _guard = parent.node.structure_lock.lock();
+
+        let fs = parent.node.file_system();
+        let node = fs
+            .directory_operations()
+            .create_directory(&parent, &dir_name)?;
+
+        let entry = self
+            .directory_cache
+            .write()
+            .insert(Some(parent.clone()), node, dir_name);
+
+        Ok(entry)
     }
 
     pub fn stat(&self, path: &str) -> Result<Arc<DirectoryEntry>, IoError> {
         self.resolve_path(path)?.ok_or(IoError::EntryNotFound)
     }
+
+    /// Locks the directory cache and performs a prune operation to free unused
+    /// memory. Should really only be called while the system is under high
+    /// memory pressure.
+    pub fn prune_directory_cache(&self) {
+        let mut cache = self.directory_cache.write();
+        cache.prune();
+    }
 }
 
-#[derive(Debug)]
-pub enum IoError {
-    OperationNotSupported,
-    InvalidMode,
-    FileSystemTypeNotFound,
-    EntryNotFound,
-    NotADirectory,
-    NotAFile,
-    RootAlreadyExists,
-    NoRootDirectory,
-    InvalidPath,
-    /// File pointer is not registered in the file table (this file has already
-    /// been closed)
-    InvalidFile,
-}
-
-#[derive(Debug, PartialEq)]
-pub struct DirectoryEntry {
-    pub name: Arc<str>,
-    pub node: Arc<FsNode>,
-    pub parent: Option<Arc<DirectoryEntry>>,
+pub struct VfsMount {
+    /// Uniquely identifies this mount (fs instance) within the VFS. Regenerated
+    /// on each successful mount invocation.
+    id: MountId,
+    /// A reference to the root directory which this file system is mounted on.
+    /// Keeping a strong reference here prevents the entry from ever being
+    /// evicted from the directory cache
+    root: Arc<DirectoryEntry>,
+    /// A reference to the instance of the mounted file system
+    pub file_system: Arc<dyn FileSystem>,
+    // TODO: do we need a counter of references to this mount so we know if we
+    // can safely unmount it?
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MountId(u64);
 
 impl MountId {
+    pub fn new() -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+        Self(NEXT_ID.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+/// Entries can only be created by the DirectoryCache. This ensures that no more
+/// than one DirectoryEntry object with the same parent and name is allocated at
+/// once. Without this constraint, maintaining consistency when moving and
+/// renaming would be impossible.
+#[derive(Debug)]
+pub struct DirectoryEntry {
+    /// Uniquely identifies this directory entry while there is a strong
+    /// reference to it. Once no strong references exist, looking up the entry
+    /// again will perform a full fs lookup and generate a new id. This ID
+    /// should only be used in the context of the cache and not by consumers of
+    /// this type. Use [`Arc`] or [`Weak`] for those purposes which also encode
+    /// ownership semantics.
+    id: DirectoryEntryId,
+
+    pub name: Arc<str>,
+    pub node: Arc<FsNode>,
+
+    // Entires always retain a strong reference to their parent to make sure
+    // their parent is never evicted from the directory cache. Since the
+    // parent's id is used as the cache key, there is no way to find this node
+    // without doing a full fs lookup if the parent is dropped.
+    pub parent: Option<Arc<DirectoryEntry>>,
+    /// Children retain a weak reference to alow them to be garbage collected
+    /// when there is high memory pressure.
+    pub children: RwLock<BTreeMap<Arc<str>, Weak<DirectoryEntry>>>,
+}
+
+impl PartialEq for DirectoryEntry {
+    fn eq(&self, other: &Self) -> bool {
+        // NOTE: the directory cache ensures that if an entry exists in the
+        // cache (and is accesible), its ID is guaranteed to uniquely identify
+        // that entry within the file system. For this reason, we can be
+        // confident that if the IDs match then they are the same entry.
+        self.id == other.id
+    }
+}
+
+impl DirectoryEntry {
+    /// Removes entries in the child cache which have already been garbage
+    /// collected
+    fn prune_children(&self) {
+        let mut children = self.children.write();
+        children.retain(|_, w| w.strong_count() > 0);
+    }
+}
+
+/// A guaranteed globally unique key which identifies a particular directory
+/// entry. For as long as there exist any strong references to that entry, it is
+/// guaranteed that no other IDs will exist for that parent and child name pair
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct DirectoryEntryId(u64);
+
+impl DirectoryEntryId {
     pub const NULL: Self = Self(0);
 
     pub fn new() -> Self {
@@ -459,14 +615,148 @@ impl MountId {
     }
 }
 
-pub struct VfsMount {
-    id: MountId,
-    /// A reference to the root directory which this file system is mounted on
-    root: Arc<DirectoryEntry>,
-    /// A reference to the instance of the mounted file system
-    pub file_system: Arc<dyn FileSystem>,
-    // TODO: do we need a counter of references to this mount so we know if we
-    // can safely unmount it?
+/// A cache for resolved directory entries. All directory entries with a live
+/// reference count are guaranteed to live in this table. Once no longer in use,
+/// entries may be evicted at any time on an LRU basis. This type is used
+/// internally by the VFS.
+#[derive(Debug, Default)]
+struct DirectoryCache {
+    table: BTreeMap<DirectoryCacheKey, Weak<DirectoryEntry>>,
+}
+
+/// A combination of the parent ID and child name, used to index the directory
+/// cache.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct DirectoryCacheKey(DirectoryEntryId, Arc<str>);
+
+impl DirectoryCache {
+    /// Gets the root directory entry if it has been inserted into the cache
+    fn get_root(&self) -> Option<Arc<DirectoryEntry>> {
+        let key = DirectoryCacheKey(DirectoryEntryId::NULL, "/".into());
+        self.table.get(&key).and_then(|w| w.upgrade())
+    }
+
+    /// Creates an entry in the cache and returns a strong reference
+    fn insert(
+        &mut self,
+        parent: Option<Arc<DirectoryEntry>>,
+        node: Arc<FsNode>,
+        name: impl Into<Arc<str>>,
+    ) -> Arc<DirectoryEntry> {
+        let name = name.into();
+
+        assert!(
+            parent.is_some() || name.as_ref() == "/",
+            "only the root entry is allowed to not have a parent"
+        );
+
+        if let Some(parent) = &parent {
+            // FIXME: should we just return the existing entry here instead of
+            // panicking?
+            assert!(
+                self.lookup(parent, &name).is_none(),
+                "attempted to re-insert existing entry"
+            );
+        }
+
+        let entry = Arc::new(DirectoryEntry {
+            id: DirectoryEntryId::new(),
+            name,
+            node,
+            parent: parent.clone(),
+            children: Default::default(),
+        });
+
+        if let Some(parent) = parent {
+            parent
+                .children
+                .write()
+                .insert(entry.name.clone(), Arc::downgrade(&entry));
+        }
+
+        let key = DirectoryCacheKey(
+            entry
+                .parent
+                .as_ref()
+                .map(|p| p.id)
+                .unwrap_or(DirectoryEntryId::NULL),
+            entry.name.clone(),
+        );
+        self.table.insert(key, Arc::downgrade(&entry));
+
+        entry
+    }
+
+    /// Gets a key from the cache if it exists. This does not perform any file
+    /// system operations or name resolution.
+    fn lookup(&self, parent: &Arc<DirectoryEntry>, name: &str) -> Option<Arc<DirectoryEntry>> {
+        let key = DirectoryCacheKey(parent.id, name.into());
+        self.table.get(&key).and_then(|w| w.upgrade())
+    }
+
+    /// Removes any entries from the table which havve a reference count of 0
+    fn prune(&mut self) {
+        self.table.retain(|_, w| w.strong_count() > 0);
+
+        for w in self.table.values_mut() {
+            if let Some(e) = w.upgrade() {
+                e.prune_children();
+            }
+        }
+    }
+}
+
+pub struct DirectoryIterationContext {
+    table: BTreeMap<Arc<str>, DirectoryIterationEntry>,
+}
+
+pub struct DirectoryIterationEntry {
+    pub name: Arc<str>,
+    pub id: FsNodeId,
+    pub kind: FsNodeKind,
+    _private: (),
+}
+
+impl From<&DirectoryEntry> for DirectoryIterationEntry {
+    fn from(value: &DirectoryEntry) -> Self {
+        Self {
+            name: value.name.clone(),
+            id: value.node.id,
+            kind: value.node.kind,
+            _private: (),
+        }
+    }
+}
+
+impl DirectoryIterationContext {
+    fn new() -> Self {
+        Self {
+            table: Default::default(),
+        }
+    }
+
+    pub fn insert(&mut self, name: &str, id: FsNodeId, kind: FsNodeKind) {
+        let name: Arc<str> = name.into();
+
+        self.table.insert(
+            name.clone(),
+            DirectoryIterationEntry {
+                name,
+                id,
+                kind,
+                _private: (),
+            },
+        );
+    }
+}
+
+impl IntoIterator for DirectoryIterationContext {
+    type Item = DirectoryIterationEntry;
+    type IntoIter = alloc::collections::btree_map::IntoValues<Arc<str>, DirectoryIterationEntry>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.table.into_values()
+    }
 }
 
 static VFS: OnceCell<VirtualFileSystem> = OnceCell::uninit();

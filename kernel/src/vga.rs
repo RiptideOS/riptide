@@ -57,6 +57,12 @@ pub enum Color {
     White = 15,
 }
 
+impl From<Color> for ColorCode {
+    fn from(value: Color) -> Self {
+        Self::new(value, Color::Black)
+    }
+}
+
 impl Writer {
     pub fn write_byte(&mut self, byte: u8) {
         match byte {
@@ -149,8 +155,8 @@ pub fn set_color_code(color: ColorCode) {
 
 /// Executes the given function with the provided color code. This function can
 /// be nested
-pub fn with_color<F: FnOnce() -> R, R>(foreground: Color, f: F) -> R {
-    let mut color_code = ColorCode::new(foreground, Color::Black);
+pub fn with_color<F: FnOnce() -> R, R>(color: impl Into<ColorCode>, f: F) -> R {
+    let mut color_code = color.into();
 
     // FIXME: is this usage of without_interrupts correct?
 

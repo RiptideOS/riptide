@@ -1,4 +1,4 @@
-use alloc::string::String;
+use alloc::{collections::vec_deque::VecDeque, format, string::String, vec::Vec};
 
 use futures_util::StreamExt;
 use keyboard::ScancodeStream;
@@ -7,8 +7,8 @@ use pc_keyboard::{DecodedKey, HandleControl, Keyboard, ScancodeSet1, layouts::Us
 
 use crate::{
     fs::{
-        FileMode,
-        vfs::{self, DirectoryEntry, IoError},
+        FileMode, FsNodeKind,
+        vfs::{self, DirectoryEntry, DirectoryIterationEntry, IoError},
     },
     vga::{self, Color, print, println},
 };
@@ -115,10 +115,10 @@ fn print_prompt() {
 async fn parse_and_execute(input: &str) -> bool {
     vga::with_color(Color::LightGray, || println!("input: {:?}", input));
 
-    let mut args = heapless::Deque::<&str, 80>::new();
+    let mut args = VecDeque::<&str>::new();
 
     for token in Parser::new(input) {
-        args.push_back(token).ok();
+        args.push_back(token);
     }
 
     vga::with_color(Color::LightGray, || println!("args: {:?}", args));
@@ -157,12 +157,14 @@ async fn parse_and_execute(input: &str) -> bool {
                 println!();
             }
             Some("ls") => {
-                let path = args.front().cloned().unwrap_or("/"); // FIXME: use pwd
+                let args = args.make_contiguous();
 
-                let all = false; // FIXME: parse from args (-a)
-                let long = true; // FIXME: parse from args (-l)
-                let human_readable = false; // FIXME: parse from args (-h)
-                let show_node_ids = false; // FIXME: parse from args (-i)
+                let path = without_flags(args).last().cloned().unwrap_or("/"); // FIXME: use pwd
+
+                let all = has_boolean_option(args, 'a');
+                let long = has_boolean_option(args, 'l');
+                let human_readable = has_boolean_option(args, 'h');
+                let show_node_ids = has_boolean_option(args, 'i');
 
                 let e = match vfs::get().stat(path) {
                     Ok(e) => e,
@@ -173,16 +175,26 @@ async fn parse_and_execute(input: &str) -> bool {
                     Err(_) => todo!(),
                 };
 
-                fn format_entry(entry: &DirectoryEntry, long: bool) {
-                    if long {
-                        println!(
-                            "{}rw-r--r--@ 1 root root {:>3} <modify_time> {}",
-                            entry.node.kind, entry.node.size, entry.name
-                        );
-                    } else {
-                        println!("{}", entry.name)
+                let format_entry_short = |entry: &DirectoryIterationEntry| {
+                    if show_node_ids {
+                        print!("{} ", entry.id.as_u64());
                     }
-                }
+
+                    vga::with_color(entry.kind.color_code(), || println!("{}", entry.name));
+                };
+
+                let format_entry_long = |entry: &DirectoryEntry| {
+                    if show_node_ids {
+                        print!("{} ", entry.node.id.as_u64());
+                    }
+
+                    let meta = entry.node.metadata.lock();
+
+                    println!(
+                        "{}rw-r--r--@ 1 root root {:>3} {:>2} {}",
+                        entry.node.kind, meta.size, meta.modified_at, entry.name
+                    );
+                };
 
                 if e.node.is_directory() {
                     let entries = match vfs::get().read_directory(path) {
@@ -190,11 +202,27 @@ async fn parse_and_execute(input: &str) -> bool {
                         Err(_) => todo!(),
                     };
 
-                    for entry in entries {
-                        format_entry(&entry, long);
+                    for child in entries {
+                        if long {
+                            // FIXME: create a path join abstraction
+
+                            let child_path = if e.name.as_ref() == "/" {
+                                format!("/{}", child.name)
+                            } else {
+                                format!("{}/{}", e.name, child.name)
+                            };
+
+                            let c = vfs::get().stat(&child_path).unwrap();
+
+                            format_entry_long(&c);
+                        } else {
+                            format_entry_short(&child);
+                        }
                     }
+                } else if long {
+                    format_entry_long(&e);
                 } else {
-                    format_entry(&e, long);
+                    format_entry_short(&e.as_ref().into());
                 }
             }
             Some("cat") => {
@@ -222,7 +250,19 @@ async fn parse_and_execute(input: &str) -> bool {
                 let f = vfs::get().open(path, FileMode::Write).unwrap();
                 vfs::get().close(f).unwrap();
             }
-            Some("mkdir") => println!("error: not implemented yet"),
+            Some("mkdir") => {
+                let args = args.make_contiguous();
+
+                let Some(path) = without_flags(args).last().cloned() else {
+                    println!("error: no path provided");
+                    break;
+                };
+
+                match vfs::get().create_directory(path) {
+                    Ok(_) => {}
+                    Err(e) => panic!("{e:?}"),
+                }
+            }
             Some("rm") => println!("error: not implemented yet"),
             Some("realpath") => println!("error: not implemented yet"),
             Some("basename") => println!("error: not implemented yet"),
@@ -242,4 +282,32 @@ async fn parse_and_execute(input: &str) -> bool {
     }
 
     false
+}
+
+/// Parses argument list for single character option flags
+fn has_boolean_option(args: &[&str], flag: char) -> bool {
+    for arg in args {
+        if !arg.starts_with("-") {
+            continue;
+        }
+
+        if arg.starts_with("--") {
+            todo!("parse named arguments");
+        }
+
+        for c in arg.chars().skip(1) {
+            if c == flag {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn without_flags<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    args.iter()
+        .filter(|a| !a.starts_with("-"))
+        .cloned()
+        .collect()
 }

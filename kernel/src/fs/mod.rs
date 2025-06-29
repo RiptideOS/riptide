@@ -1,4 +1,4 @@
-use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, sync::Arc};
 use core::{
     any::Any,
     fmt::Display,
@@ -6,9 +6,9 @@ use core::{
 };
 
 use spin::Mutex;
-use vfs::{DirectoryEntry, IoError, MountId};
+use vfs::{DirectoryEntry, DirectoryIterationContext, IoError, MountId};
 
-use crate::drivers;
+use crate::{drivers, vga};
 
 pub mod path;
 pub mod registry;
@@ -140,37 +140,37 @@ pub trait DirectoryOperations: Send + Sync {
     /// Creates a new file on disk and allocates a new FsNodeId
     fn create_file(
         &self,
-        _directory: Arc<DirectoryEntry>,
+        _directory: &Arc<DirectoryEntry>,
         _name: &str,
-    ) -> Result<Arc<DirectoryEntry>, IoError> {
+    ) -> Result<Arc<FsNode>, IoError> {
         Err(IoError::OperationNotSupported)
     }
 
     /// Creates a new directory on disk and allocates a new FsNodeId
     fn create_directory(
         &self,
-        _directory: Arc<DirectoryEntry>,
+        _directory: &Arc<DirectoryEntry>,
         _name: &str,
-    ) -> Result<Arc<DirectoryEntry>, IoError> {
+    ) -> Result<Arc<FsNode>, IoError> {
         Err(IoError::OperationNotSupported)
     }
 
     /// Removes a file in this directory from disk
-    fn remove_file(&self) -> Result<Arc<FsNode>, IoError> {
+    fn remove_file(&self, _parent: &Arc<DirectoryEntry>, _name: &str) -> Result<(), IoError> {
         Err(IoError::OperationNotSupported)
     }
 
     /// Removes an empty child directory from disk
-    fn remove_directory(&self) -> Result<Arc<FsNode>, IoError> {
+    fn remove_directory(&self, _parent: &Arc<DirectoryEntry>, _name: &str) -> Result<(), IoError> {
         Err(IoError::OperationNotSupported)
     }
 
     /// Looks up an FsNode by name in this directory
     fn lookup(
         &self,
-        entry: Arc<DirectoryEntry>,
+        entry: &Arc<DirectoryEntry>,
         name: &str,
-    ) -> Result<Option<Arc<DirectoryEntry>>, IoError>;
+    ) -> Result<Option<Arc<FsNode>>, IoError>;
 
     /// Iterates all the entries in this directory
     ///
@@ -178,8 +178,9 @@ pub trait DirectoryOperations: Send + Sync {
     /// responses for large directories
     fn read_directory(
         &self,
-        entry: Arc<DirectoryEntry>,
-    ) -> Result<Vec<Arc<DirectoryEntry>>, IoError>;
+        context: &mut DirectoryIterationContext,
+        entry: &Arc<DirectoryEntry>,
+    ) -> Result<(), IoError>;
 }
 
 macro_rules! impl_fs_ops_for_self {
@@ -213,20 +214,35 @@ pub struct FsNode {
     /// The type of node and a pointer to the corresponding trait object which
     /// implements it's operations
     pub kind: FsNodeKind,
+    /// VFS specific metdaata about this node
+    pub metadata: Mutex<FsNodeMetadata>,
+    /// Protects this FsNode from concurrent structural operations (such as
+    /// creating new entries in a directory, renaming entries, removing this
+    /// directory or entries within it, etc.)
+    pub structure_lock: Mutex<FsNodeLock>,
+    /// Container which may be used by the FS implementation to store additional
+    /// data with this FsNode
+    pub private_data: Option<Box<dyn Any + Send + Sync>>,
+}
+
+#[derive(Debug)]
+pub struct FsNodeMetadata {
     /// Marker for the VFS to keep track of whether this node needs to be
     /// written to disk
     pub dirty: bool,
-    /* metadata used by the VFS*/
+    /// Keeps track of the number of hard links and other references to this
+    /// node (such as opened files). Once this count drops to 0, the node can be
+    /// removed from caches and evicted from the disk.
+    pub link_count: usize,
     /// The current size of the file or directory
     pub size: usize,
     pub accessed_at: u64,
     pub created_at: u64,
     pub modified_at: u64,
-    /* other */
-    /// Container which may be used by the FS implementation to store additional
-    /// data with this FsNode
-    pub private_data: Option<Box<dyn Any + Send + Sync>>,
 }
+
+#[derive(Debug)]
+pub struct FsNodeLock;
 
 impl PartialEq for FsNode {
     fn eq(&self, other: &Self) -> bool {
@@ -258,8 +274,16 @@ impl FsNode {
         self.kind == FsNodeKind::Directory
     }
 
-    pub fn is_file(&self) -> bool {
-        self.kind == FsNodeKind::File
+    pub fn increment_link_count(&self) {
+        let mut meta = self.metadata.lock();
+        meta.link_count += 1;
+    }
+
+    pub fn decrement_link_count(&self) {
+        let mut meta = self.metadata.lock();
+        meta.link_count -= 1;
+
+        // FIXME: check link count and remove or add to removal list?
     }
 }
 
@@ -298,6 +322,18 @@ impl Display for FsNodeKind {
                 FsNodeKind::BlockDevice => "d",
             }
         )
+    }
+}
+
+impl FsNodeKind {
+    pub fn color_code(self) -> vga::ColorCode {
+        match self {
+            FsNodeKind::Directory => vga::Color::LightBlue,
+            FsNodeKind::File => vga::Color::White,
+            FsNodeKind::CharDevice => vga::Color::Yellow,
+            FsNodeKind::BlockDevice => vga::Color::LightCyan,
+        }
+        .into()
     }
 }
 

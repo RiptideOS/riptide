@@ -13,7 +13,7 @@ lazy_static::lazy_static! {
 #[derive(Debug)]
 pub enum FileSystemRegistrationError {
     NameConflict,
-    MagicConflict,
+    // MagicConflict,
 }
 
 /// Registers a file system type to be used when mounting and detecting file
@@ -31,7 +31,7 @@ pub fn register_file_system(
     }
 
     // FIXME: add this back
-    
+
     // // Make sure no other file systems are registered with the same magic bytes
     // if registry
     //     .values()

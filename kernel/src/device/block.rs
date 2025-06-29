@@ -1,4 +1,3 @@
-
 /// Represents an abstract device which can read and write data to/from a store
 /// in fixed size blocks
 pub trait BlockDevice {
